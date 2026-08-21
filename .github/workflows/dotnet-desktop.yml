@@ -13,9 +13,6 @@ jobs:
     env:
       # 🛠️ 1. REPLACE WITH YOUR EXACT ROOT CSPROJ FILENAME
       Dll_Project_Path: USMHandler.csproj 
-      
-      # 🛠️ 2. REPLACE WITH YOUR EXACT DLL FILENAME OUTPUT TARGET
-      Dll_Output_Path: **/USMHandler.dll 
 
     steps:
     - name: Checkout Code
@@ -36,5 +33,5 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: Compiled-Core-DLL # ◄ The name of the zip link on your web dashboard
-        path: ${{ env.Dll_Output_Path }} # ◄ Grabs the exact compiled library file
+        path: "**/USMHandler.dll" # ◄ Grabs the exact compiled library file
         if-no-files-found: error # ◄ Forces the build to fail if paths are typoed
