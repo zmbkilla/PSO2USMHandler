@@ -10,6 +10,9 @@ Thanks as well to the pso2 modding community for information regarding usm files
 Download the source and place the ffmpeg libraries in a folder called "FFMPEG".
 Make sure they match the architecture of your target platform.
 
+Current version used is 9.0.1
+- [Auto-Build 2026-08-20 13:45](https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-08-20-13-45)
+
 <h2>Usage</h2>
 
 Added a test WPF app to decode and display video out using an image.
