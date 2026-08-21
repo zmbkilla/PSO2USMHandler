@@ -15,7 +15,7 @@ jobs:
       Dll_Project_Path: USMHandler.csproj 
       
       # 🛠️ 2. REPLACE WITH YOUR EXACT DLL FILENAME OUTPUT TARGET
-      Dll_Output_Path: **/PSO2USMHandler.dll 
+      Dll_Output_Path: **/USMHandler.dll 
 
     steps:
     - name: Checkout Code
