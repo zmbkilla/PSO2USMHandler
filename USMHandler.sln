@@ -1,11 +1,13 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
-VisualStudioVersion = 17.14.37531.7 d17.14
+VisualStudioVersion = 17.14.37531.7
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "USMHandler", "USMHandler.csproj", "{2372849D-C1EE-4C66-AF9C-8C5C15A858AA}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Testapp", "..\Testapp\Testapp.csproj", "{AEF3FA2F-9A1F-4DB4-88CD-818E4A9C8594}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CallVLC", "..\CallVLC\CallVLC.csproj", "{1A2C0802-F80E-42E9-92E3-1E7CC2747F7B}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -41,6 +43,18 @@ Global
 		{AEF3FA2F-9A1F-4DB4-88CD-818E4A9C8594}.Release|x64.Build.0 = Release|x64
 		{AEF3FA2F-9A1F-4DB4-88CD-818E4A9C8594}.Release|x86.ActiveCfg = Release|x86
 		{AEF3FA2F-9A1F-4DB4-88CD-818E4A9C8594}.Release|x86.Build.0 = Release|x86
+		{1A2C0802-F80E-42E9-92E3-1E7CC2747F7B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1A2C0802-F80E-42E9-92E3-1E7CC2747F7B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1A2C0802-F80E-42E9-92E3-1E7CC2747F7B}.Debug|x64.ActiveCfg = Debug|x64
+		{1A2C0802-F80E-42E9-92E3-1E7CC2747F7B}.Debug|x64.Build.0 = Debug|x64
+		{1A2C0802-F80E-42E9-92E3-1E7CC2747F7B}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{1A2C0802-F80E-42E9-92E3-1E7CC2747F7B}.Debug|x86.Build.0 = Debug|Any CPU
+		{1A2C0802-F80E-42E9-92E3-1E7CC2747F7B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1A2C0802-F80E-42E9-92E3-1E7CC2747F7B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{1A2C0802-F80E-42E9-92E3-1E7CC2747F7B}.Release|x64.ActiveCfg = Release|Any CPU
+		{1A2C0802-F80E-42E9-92E3-1E7CC2747F7B}.Release|x64.Build.0 = Release|Any CPU
+		{1A2C0802-F80E-42E9-92E3-1E7CC2747F7B}.Release|x86.ActiveCfg = Release|Any CPU
+		{1A2C0802-F80E-42E9-92E3-1E7CC2747F7B}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

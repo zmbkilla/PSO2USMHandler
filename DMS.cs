@@ -21,7 +21,14 @@ namespace USMHandler
         public override long Position
         {
             get => _position;
-            set => _position = value;
+            set
+            {
+                lock (_memoryStream)
+                {
+                    _position = value;
+                    _memoryStream.Position = value;
+                }
+            }
         }
 
         public override bool CanRead => true;
@@ -62,24 +69,44 @@ namespace USMHandler
         {
             lock (_memoryStream)
             {
+                long newPosition;
+
                 switch (origin)
                 {
                     case SeekOrigin.Begin:
-                        _position = offset;
+                        newPosition = offset;
                         break;
+
                     case SeekOrigin.Current:
-                        _position += offset;
+                        newPosition = _position + offset;
                         break;
+
                     case SeekOrigin.End:
-                        _position = _memoryStream.Length - offset;
+                        newPosition = _memoryStream.Length + offset;
                         break;
+
+                    default:
+                        throw new ArgumentOutOfRangeException(nameof(origin));
                 }
+
+                newPosition = Math.Clamp(
+                    newPosition,
+                    0,
+                    _memoryStream.Length
+                );
+
+                _position = newPosition;
+                _memoryStream.Position = newPosition;
+
+                return _position;
             }
-            return _position;
         }
+
+
 
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
+
 
 }

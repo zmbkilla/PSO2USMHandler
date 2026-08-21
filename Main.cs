@@ -1,16 +1,16 @@
 ﻿using FFmpeg;
 using FFmpeg.AutoGen;
 using Microsoft.VisualBasic;
-using NAudio.Wave;
 using System.Numerics;
 using System.Text;
 using System.Runtime.InteropServices;
+using System.IO.Pipelines;
 
 namespace USMHandler
 {
     public class Main
     {
-        private CancellationTokenSource? _playbackCts;
+        public CancellationTokenSource? _playbackCts;
 
         public bool smallerthanmb = false;
         public bool hasAudio = false;
@@ -28,13 +28,10 @@ namespace USMHandler
         // ADX Audio Decompressor State Keepers
         private static int _adxPrevSampleL = 0;
         private static int _adxPrevSampleR = 0;
-
-        //naudio
-        private static IWavePlayer _naudioOutputDevice;
-        private static BufferedWaveProvider _naudioBufferProvider;
         private unsafe AVCodecContext* _audioCodecContext = null;
         private unsafe AVFrame* _audioFrame = null;
         private static unsafe SwrContext* _audioSwrContext = null;
+
 
 
         private byte[] permanentPixelBuffer;
@@ -65,6 +62,51 @@ namespace USMHandler
             Console.WriteLine("MPEG-2 decoder found.");
             return true;
         }
+
+
+        public async Task<Stream> LoadDirectUSM(string filepath, byte[] key1, byte[] key2)
+        {
+            _playbackCts?.Cancel();
+            _playbackCts?.Dispose();
+            _playbackCts = new CancellationTokenSource();
+
+            FFmpeg.AutoGen.ffmpeg.RootPath = AppDomain.CurrentDomain.BaseDirectory + "FFMPEG";
+
+            Console.WriteLine(ffmpeg.av_version_info());
+
+            smallerthanmb = false;
+            hasAudio = false;
+
+            string outputPath = Path.Combine(
+                AppDomain.CurrentDomain.BaseDirectory,
+                "demux_test.usm");
+
+            FileStream outputFile = File.Create(outputPath);
+
+            try
+            {
+                await Task.Run(() =>
+                    DirectDemuxASync(
+                        filepath,
+                        key1,
+                        key2,
+                        outputFile,
+                        _playbackCts.Token));
+
+                outputFile.Position = 0;
+
+                Console.WriteLine($"Demux output written to: {outputPath}");
+                Console.WriteLine($"Size: {outputFile.Length:N0} bytes");
+
+                return outputFile;
+            }
+            catch
+            {
+                outputFile.Dispose();
+                throw;
+            }
+        }
+
 
 
 
@@ -246,138 +288,258 @@ namespace USMHandler
             if (videoFrame != null) ffmpeg.av_frame_free(&videoFrame);
         }
 
+        public delegate void AudioPcmDataHandler(    byte[] pcmData,    int sampleRate,    int channels,    int bitsPerSample);
+
+        public event AudioPcmDataHandler? AudioPcmDataDecoded;
+
         private unsafe void StreamAudioOnlyWorker(DynamicMemoryStream audioData, CancellationToken token)
         {
-            AVCodec* audioCodec = ffmpeg.avcodec_find_decoder(AVCodecID.AV_CODEC_ID_ADPCM_ADX);
+            AVCodec* audioCodec =
+                ffmpeg.avcodec_find_decoder(AVCodecID.AV_CODEC_ID_ADPCM_ADX);
+
             if (audioCodec == null)
+                return;
+
+            AVCodecContext* audioCtx =
+                ffmpeg.avcodec_alloc_context3(audioCodec);
+
+            AVCodecParserContext* audioParser =
+                ffmpeg.av_parser_init(AVCodecID.AV_CODEC_ID_ADPCM_ADX);
+
+            AVFrame* audioFrame =
+                ffmpeg.av_frame_alloc();
+
+            if (audioCtx == null || audioParser == null || audioFrame == null)
             {
+                if (audioParser != null)
+                    ffmpeg.av_parser_close(audioParser);
+
+                if (audioCtx != null)
+                    ffmpeg.avcodec_free_context(&audioCtx);
+
+                if (audioFrame != null)
+                    ffmpeg.av_frame_free(&audioFrame);
+
                 return;
             }
-
-            AVCodecContext* audioCtx = ffmpeg.avcodec_alloc_context3(audioCodec);
-            AVCodecParserContext* audioParser = ffmpeg.av_parser_init(AVCodecID.AV_CODEC_ID_ADPCM_ADX);
-            AVFrame* audioFrame = ffmpeg.av_frame_alloc();
 
             if (ffmpeg.avcodec_open2(audioCtx, audioCodec, null) < 0)
             {
+                ffmpeg.av_parser_close(audioParser);
+                ffmpeg.avcodec_free_context(&audioCtx);
+                ffmpeg.av_frame_free(&audioFrame);
                 return;
             }
 
-            // FIX 1: Lock NAudio to a standard high-quality 48000Hz format. 
-            // We will let the unmanaged resampler handle converting the file's native rate to match this.
-            int targetSampleRate = 48000;
-            var waveFormat = new WaveFormat(targetSampleRate, 16, 2);
-
-            _naudioBufferProvider = new BufferedWaveProvider(waveFormat)
-            {
-                BufferLength = 2 * 1024 * 1024,
-                DiscardOnBufferOverflow = true
-            };
-
-            _naudioOutputDevice = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, 20);
-            _naudioOutputDevice.Init(_naudioBufferProvider);
-            _naudioOutputDevice.Play();
+            const int targetSampleRate = 48000;
+            const int targetChannels = 2;
+            const int targetBitsPerSample = 16;
+            const int bytesPerStereoFrame = targetChannels * sizeof(short); // 4 bytes
 
             AVPacket* audioPkt = ffmpeg.av_packet_alloc();
-            byte[] audioBuffer = new byte[65536]; // Safe expanded buffer size 
-            bool parse_succeed = true;
+            byte[] audioBuffer = new byte[65536];
+            bool parseSucceed = true;
             SwrContext* audioSwrContext = null;
 
-            while (parse_succeed)
+            // ⏱️ HIGH-PRECISION FLOW THROTTLE
+            System.Diagnostics.Stopwatch playbackClock = new System.Diagnostics.Stopwatch();
+            double totalDecodedAudioMs = 0;
+            bool clockStarted = false;
+
+            try
             {
-                if (token.IsCancellationRequested)
-                    return;
-                // BACKPRESSURE THROTTLE: Keep the audio thread sleeping if NAudio's buffer tank is full.
-                if (_naudioBufferProvider != null && _naudioBufferProvider.BufferedDuration.TotalMilliseconds > 200)
+                while (parseSucceed && !token.IsCancellationRequested)
                 {
-                    System.Threading.Thread.Sleep(10);
-                    continue;
-                }
-
-                int audioRead = audioData.Read(audioBuffer, 0, audioBuffer.Length);
-                if (audioRead <= 0) break; // End of audio stream data
-
-                fixed (byte* audioPtr = audioBuffer)
-                {
-                    byte* data = audioPtr;
-                    int remainingAudioSize = audioRead;
-
-                    while (remainingAudioSize > 0)
+                    // ⏳ BACKPRESSURE THROTTLE:
+                    // If the loop has decoded more than 300ms ahead of real-world time, 
+                    // force the thread to sleep until the real-world timeline catches up.
+                    if (clockStarted && totalDecodedAudioMs > (playbackClock.Elapsed.TotalMilliseconds + 300))
                     {
-                        byte* outAudioData = null;
-                        int outAudioSize = 0;
+                        System.Threading.Thread.Sleep(10);
+                        continue;
+                    }
 
-                        int ret = ffmpeg.av_parser_parse2(audioParser, audioCtx,
-                            &outAudioData, &outAudioSize, data, remainingAudioSize, ffmpeg.AV_NOPTS_VALUE, ffmpeg.AV_NOPTS_VALUE, 0);
+                    int audioRead =
+                        audioData.Read(
+                            audioBuffer,
+                            0,
+                            audioBuffer.Length);
 
-                        if (ret < 0) break;
+                    if (audioRead <= 0)
+                        break;
 
-                        audioPkt->data = outAudioData;
-                        audioPkt->size = outAudioSize;
-                        data += ret;
-                        remainingAudioSize -= ret;
+                    fixed (byte* audioPtr = audioBuffer)
+                    {
+                        byte* data = audioPtr;
+                        int remainingAudioSize = audioRead;
 
-                        if (audioPkt->size != 0 && ffmpeg.avcodec_send_packet(audioCtx, audioPkt) >= 0)
+                        while (
+                            remainingAudioSize > 0 &&
+                            !token.IsCancellationRequested)
                         {
-                            while (ffmpeg.avcodec_receive_frame(audioCtx, audioFrame) == 0)
+                            byte* outAudioData = null;
+                            int outAudioSize = 0;
+
+                            int ret = ffmpeg.av_parser_parse2(
+                                audioParser,
+                                audioCtx,
+                                &outAudioData,
+                                &outAudioSize,
+                                data,
+                                remainingAudioSize,
+                                ffmpeg.AV_NOPTS_VALUE,
+                                ffmpeg.AV_NOPTS_VALUE,
+                                0);
+
+                            if (ret < 0)
+                            {
+                                parseSucceed = false;
+                                break;
+                            }
+
+                            data += ret;
+                            remainingAudioSize -= ret;
+
+                            audioPkt->data = outAudioData;
+                            audioPkt->size = outAudioSize;
+
+                            if (audioPkt->size == 0)
+                                continue;
+
+                            if (ffmpeg.avcodec_send_packet(
+                                audioCtx,
+                                audioPkt) < 0)
+                            {
+                                continue;
+                            }
+
+                            while (
+                                !token.IsCancellationRequested &&
+                                ffmpeg.avcodec_receive_frame(
+                                    audioCtx,
+                                    audioFrame) == 0)
                             {
                                 int samples = audioFrame->nb_samples;
-                                int targetChannels = 2;
+
+                                if (samples <= 0)
+                                    continue;
 
                                 if (audioSwrContext == null)
                                 {
-                                    SwrContext* localSwr = ffmpeg.swr_alloc();
+                                    SwrContext* localSwr =
+                                        ffmpeg.swr_alloc();
+
                                     AVChannelLayout targetLayout;
-                                    ffmpeg.av_channel_layout_default(&targetLayout, targetChannels);
 
-                                    // Fetch the input frame's layout directly
-                                    AVChannelLayout srcLayout = audioFrame->ch_layout;
+                                    ffmpeg.av_channel_layout_default(
+                                        &targetLayout,
+                                        targetChannels);
 
-                                    // FIX 2: Force the resampler to output 'targetSampleRate' (48000Hz) 
-                                    // regardless of what 'audioFrame->sample_rate' detects from the file.
-                                    ffmpeg.swr_alloc_set_opts2(
-                                        &localSwr,
-                                        &targetLayout, AVSampleFormat.AV_SAMPLE_FMT_S16, targetSampleRate,
-                                        &srcLayout, (AVSampleFormat)audioFrame->format, audioFrame->sample_rate,
-                                        0, null
-                                    );
-                                    ffmpeg.swr_init(localSwr);
+                                    AVChannelLayout srcLayout =
+                                        audioFrame->ch_layout;
+
+                                    int swrResult =
+                                        ffmpeg.swr_alloc_set_opts2(&localSwr, &targetLayout, AVSampleFormat.AV_SAMPLE_FMT_S16, targetSampleRate, &srcLayout, (AVSampleFormat)audioFrame->format, audioFrame->sample_rate, 0, null);
+
+                                    if (swrResult < 0 ||
+                                        localSwr == null)
+                                    {
+                                        if (localSwr != null)
+                                            ffmpeg.swr_free(&localSwr);
+
+                                        parseSucceed = false;
+                                        break;
+                                    }
+
+                                    if (ffmpeg.swr_init(localSwr) < 0)
+                                    {
+                                        ffmpeg.swr_free(&localSwr);
+                                        parseSucceed = false;
+                                        break;
+                                    }
+
                                     audioSwrContext = localSwr;
                                 }
 
-                                // FIX 3: Calculate the correct output buffer size based on the new target sample rate calculation.
-                                // (samples * targetSampleRate / frameSampleRate) determines how many output samples are actually generated.
-                                int outSamples = (int)ffmpeg.av_rescale_rnd(samples, targetSampleRate, audioFrame->sample_rate, AVRounding.AV_ROUND_UP);
-                                byte[] resampledBuffer = new byte[outSamples * targetChannels * 2];
+                                int outSamples =
+                                    (int)ffmpeg.av_rescale_rnd(
+                                        samples,
+                                        targetSampleRate,
+                                        audioFrame->sample_rate,
+                                        AVRounding.AV_ROUND_UP);
 
-                                fixed (byte* outBufPtr = resampledBuffer)
+                                if (outSamples <= 0)
+                                    continue;
+
+                                byte[] pcmData =
+                                    new byte[
+                                        outSamples *
+                                        targetChannels *
+                                        sizeof(short)
+                                    ];
+
+                                int convertedSamples;
+
+                                fixed (byte* pcmPtr = pcmData)
                                 {
-                                    byte*[] outPlanes = new byte*[] { outBufPtr, (byte*)0, (byte*)0, (byte*)0, (byte*)0, (byte*)0, (byte*)0, (byte*)0 };
+                                    byte*[] outPlanes = { pcmPtr, null, null, null };
+
                                     fixed (byte** outPlanesPtr = outPlanes)
                                     {
-                                        ffmpeg.swr_convert(audioSwrContext, outPlanesPtr, outSamples, (byte**)audioFrame->extended_data, samples);
+                                        convertedSamples =
+                                            ffmpeg.swr_convert(audioSwrContext, outPlanesPtr, outSamples, (byte**)audioFrame->extended_data, samples);
                                     }
                                 }
 
-                                _naudioBufferProvider?.AddSamples(resampledBuffer, 0, resampledBuffer.Length);
+                                if (convertedSamples <= 0)
+                                    continue;
+
+                                int pcmByteCount =
+                                    convertedSamples *
+                                    targetChannels *
+                                    sizeof(short);
+
+                                if (pcmByteCount != pcmData.Length)
+                                {
+                                    Array.Resize(
+                                        ref pcmData,
+                                        pcmByteCount);
+                                }
+
+                                // ⏱️ TIMELINE MATH:
+                                // Convert the number of processed samples into exact audio timeline milliseconds.
+                                double sampleDurationMs = ((double)convertedSamples / targetSampleRate) * 1000.0;
+                                totalDecodedAudioMs += sampleDurationMs;
+
+                                // Start tracking real-world time the moment the first sample block completes
+                                if (!clockStarted)
+                                {
+                                    playbackClock.Start();
+                                    clockStarted = true;
+                                }
+
+                                /*
+                                 * OUTPUT DRIVEN BY SELF-PACED REAL-TIME CLOCK
+                                 */
+                                AudioPcmDataDecoded?.Invoke(
+                                    pcmData,
+                                    targetSampleRate,
+                                    targetChannels,
+                                    targetBitsPerSample);
                             }
                         }
                     }
                 }
             }
-
-            // Cleanup audio thread allocations
-            ffmpeg.av_packet_free(&audioPkt);
-            if (audioParser != null) ffmpeg.av_parser_close(audioParser);
-            if (audioCtx != null) ffmpeg.avcodec_free_context(&audioCtx);
-            if (audioFrame != null) ffmpeg.av_frame_free(&audioFrame);
-            if (audioSwrContext != null) ffmpeg.swr_free(&audioSwrContext);
-
-            if (_naudioOutputDevice != null)
+            finally
             {
-                _naudioOutputDevice.Stop();
-                _naudioOutputDevice.Dispose();
-                _naudioOutputDevice = null;
+                playbackClock.Stop();
+
+                ffmpeg.av_packet_free(&audioPkt);
+                if (audioParser != null) ffmpeg.av_parser_close(audioParser);
+                if (audioCtx != null) ffmpeg.avcodec_free_context(&audioCtx);
+                if (audioFrame != null) ffmpeg.av_frame_free(&audioFrame);
+                if (audioSwrContext != null) ffmpeg.swr_free(&audioSwrContext);
             }
         }
 
@@ -386,58 +548,59 @@ namespace USMHandler
 
 
 
-        private static Vector2[] DecodeAdxToPcmFrames(byte[] inputData, int dataSize)
-        {
-            // CriWare ADX blocks typically process in 18-byte sequential frame groupings 
-            // containing historical layout prediction scale bytes followed by nibble blocks
-            int totalFrames = dataSize / 18;
-            if (totalFrames <= 0) return Array.Empty<Vector2>();
 
-            // Each 18-byte ADX packet segment yields exactly 32 stereo audio output samples
-            var pcmFrames = new Vector2[totalFrames * 32];
-            int frameIndex = 0;
-
-            // Standard ADX historical sound optimization filter weights
-            double coef1 = 1.8310546875;
-            double coef2 = -0.83544921875;
-
-            for (int b = 0; b < totalFrames; b++)
-            {
-                int offset = b * 18;
-
-                // Extract the scale factor properties for the current audio block range
-                short scale = (short)((inputData[offset] << 8) | inputData[offset + 1]);
-
-                for (int i = 0; i < 16; i++)
-                {
-                    byte sampleByte = inputData[offset + 2 + i];
-
-                    // Slice raw payload byte segments into independent 4-bit sound channel nibbles
-                    int nibbleL = (sampleByte >> 4) & 0x0F;
-                    int nibbleR = sampleByte & 0x0F;
-
-                    // Convert to signed integer properties scale values
-                    if (nibbleL >= 8) nibbleL -= 16;
-                    if (nibbleR >= 8) nibbleR -= 16;
-
-                    // Execute prediction calculations for Left channel signals
-                    double sampleL = (nibbleL * scale) + (coef1 * _adxPrevSampleL) + (coef2 * _adxPrevSampleL);
-                    _adxPrevSampleL = (int)Math.Clamp(sampleL, short.MinValue, short.MaxValue);
-
-                    // Execute prediction calculations for Right channel signals
-                    double sampleR = (nibbleR * scale) + (coef1 * _adxPrevSampleR) + (coef2 * _adxPrevSampleR);
-                    _adxPrevSampleR = (int)Math.Clamp(sampleR, short.MinValue, short.MaxValue);
-
-                    // Output the normalized sound coordinates into your Godot balance vectors
-                    pcmFrames[frameIndex++] = new Vector2(
-                        _adxPrevSampleL / 32768.0f,
-                        _adxPrevSampleR / 32768.0f
-                    );
-                }
-            }
-
-            return pcmFrames;
-        }
+        //private static Vector2[] DecodeAdxToPcmFrames(byte[] inputData, int dataSize)
+        //{
+        //    // CriWare ADX blocks typically process in 18-byte sequential frame groupings 
+        //    // containing historical layout prediction scale bytes followed by nibble blocks
+        //    int totalFrames = dataSize / 18;
+        //    if (totalFrames <= 0) return Array.Empty<Vector2>();
+        //
+        //    // Each 18-byte ADX packet segment yields exactly 32 stereo audio output samples
+        //    var pcmFrames = new Vector2[totalFrames * 32];
+        //    int frameIndex = 0;
+        //
+        //    // Standard ADX historical sound optimization filter weights
+        //    double coef1 = 1.8310546875;
+        //    double coef2 = -0.83544921875;
+        //
+        //    for (int b = 0; b < totalFrames; b++)
+        //    {
+        //        int offset = b * 18;
+        //
+        //        // Extract the scale factor properties for the current audio block range
+        //        short scale = (short)((inputData[offset] << 8) | inputData[offset + 1]);
+        //
+        //        for (int i = 0; i < 16; i++)
+        //        {
+        //            byte sampleByte = inputData[offset + 2 + i];
+        //
+        //            // Slice raw payload byte segments into independent 4-bit sound channel nibbles
+        //            int nibbleL = (sampleByte >> 4) & 0x0F;
+        //            int nibbleR = sampleByte & 0x0F;
+        //
+        //            // Convert to signed integer properties scale values
+        //            if (nibbleL >= 8) nibbleL -= 16;
+        //            if (nibbleR >= 8) nibbleR -= 16;
+        //
+        //            // Execute prediction calculations for Left channel signals
+        //            double sampleL = (nibbleL * scale) + (coef1 * _adxPrevSampleL) + (coef2 * _adxPrevSampleL);
+        //            _adxPrevSampleL = (int)Math.Clamp(sampleL, short.MinValue, short.MaxValue);
+        //
+        //            // Execute prediction calculations for Right channel signals
+        //            double sampleR = (nibbleR * scale) + (coef1 * _adxPrevSampleR) + (coef2 * _adxPrevSampleR);
+        //            _adxPrevSampleR = (int)Math.Clamp(sampleR, short.MinValue, short.MaxValue);
+        //
+        //            // Output the normalized sound coordinates into your Godot balance vectors
+        //            pcmFrames[frameIndex++] = new Vector2(
+        //                _adxPrevSampleL / 32768.0f,
+        //                _adxPrevSampleR / 32768.0f
+        //            );
+        //        }
+        //    }
+        //
+        //    return pcmFrames;
+        //}
 
 
 
@@ -562,6 +725,55 @@ namespace USMHandler
             }
             return true;
         }
+
+        public bool DirectDemuxASync(string filenameArg, byte[] key1Arg, byte[] key2Arg, Stream output,CancellationToken cts)
+        {
+            if (!File.Exists(filenameArg)) throw new FileNotFoundException($"File {filenameArg} doesn't exist...");
+            string filename = Path.GetFileName(filenameArg);
+            byte[] key1, key2;
+            if (key1Arg.Length == 0 && key2Arg.Length == 0)
+            {
+                Console.WriteLine($"Finding encryption key for {filename}...");
+                (byte[], byte[])? split = KeySplitter(EncryptionKey(filename));
+                if (split == null) return false;
+                key1 = split.Value.Item1;
+                key2 = split.Value.Item2;
+            }
+            else
+            {
+                key1 = key1Arg;
+                key2 = key2Arg;
+            }
+            key1 = key1.Reverse().ToArray();
+            key2 = key2.Reverse().ToArray();
+
+            USM file = new(filenameArg, key1, key2);
+
+            // Fix: Replaced new FileStream with File.OpenRead to avoid SafeFileHandle signature mismatch issues
+            using (FileStream fs = File.OpenRead(filenameArg))
+            {
+                byte[] check = new byte[4];
+                if (fs.Read(check, 0, 4) != 4 || Encoding.ASCII.GetString(check) != "CRID")
+                {
+                    return false;
+                }
+            }
+
+
+            file.DemuxOnly(output,cts);
+            if (file.done)
+            {
+                smallerthanmb = true;
+            }
+            return true;
+        }
+
+
+
+        //adding it here for now
+
+
+
 
         //end of code
     }

@@ -132,6 +132,61 @@ namespace USMHandler
             }
         }
 
+        // --- THE SIMPLIFIED UNIFIED PIPELINE METHOD ---
+        /// <summary>
+        /// Decrypts the USM container block-by-block and streams the unified, clean data out to a target stream.
+        /// </summary>
+        public async Task DemuxOnly(Stream outputStream, CancellationToken token)
+        {
+            using (FileStream filePointer = File.OpenRead(_path))
+            {
+                Info info = new();
+                while (filePointer.Position < filePointer.Length && !token.IsCancellationRequested)
+                {
+                    byte[] byteBlock = new byte[32];
+                    int bytesRead = await filePointer.ReadAsync(byteBlock, 0, byteBlock.Length, token);
+                    if (bytesRead <= 0)
+                    {
+                        break;
+                    }
+
+                    info.signature = Bswap(BitConverter.ToUInt32(byteBlock, 0));
+                    info.dataSize = Bswap(BitConverter.ToUInt32(byteBlock, 4));
+                    info.dataOffset = byteBlock[9];
+                    info.paddingSize = Bswap(BitConverter.ToUInt16(byteBlock, 10));
+                    info.chno = byteBlock[12];
+                    info.dataType = byteBlock[15];
+
+                    int metadataSize = info.dataOffset - 0x18;
+                    int size = (int)(info.dataSize - info.dataOffset - info.paddingSize);
+
+                    byte[] metadata = new byte[metadataSize];
+                    await filePointer.ReadAsync(metadata, 0, metadata.Length, token);
+
+                    byte[] data = new byte[size];
+                    await filePointer.ReadAsync(data, 0, data.Length, token);
+
+                    byte[] padding = new byte[info.paddingSize];
+                    await filePointer.ReadAsync(padding, 0, padding.Length, token);
+
+                    if (info.signature == 0x40534656 && info.dataType == 0)
+                    {
+                        MaskVideo(ref data, size);
+                    }
+                    else if (info.signature == 0x40534641)
+                    {
+                        MaskAudio(ref data, (uint)size);
+                    }
+
+                    await outputStream.WriteAsync(byteBlock, 0, byteBlock.Length, token);
+                    await outputStream.WriteAsync(metadata, 0, metadata.Length, token);
+                    await outputStream.WriteAsync(data, 0, data.Length, token);
+                    await outputStream.WriteAsync(padding, 0, padding.Length, token);
+                }
+            }
+        }
+
+
         public Dictionary<string, List<string>> Demux(bool videoExtract, bool audioExtract, ref byte[] videoout, ref byte[] audiout)
         {
 
