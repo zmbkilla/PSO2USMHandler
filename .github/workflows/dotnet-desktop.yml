@@ -1,0 +1,30 @@
+name: Build USMHandler.dll
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    env:
+      # 🛠️ CHANGE THIS TO YOUR EXACT FILENAME SITTING IN THE ROOT
+      Dll_Project_Path: USMHandler.csproj 
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Install .NET SDK
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+
+    - name: Restore DLL Dependencies
+      run: dotnet restore ${{ env.Dll_Project_Path }}
+
+    - name: Build DLL Project Only
+      run: dotnet build ${{ env.Dll_Project_Path }} --configuration Release --no-restore
