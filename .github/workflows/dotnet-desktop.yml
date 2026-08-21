@@ -1,4 +1,4 @@
-name: Build USMHandler.dll
+name: Build C# DLL Only
 
 on:
   push:
@@ -11,8 +11,11 @@ jobs:
     runs-on: windows-latest
 
     env:
-      # 🛠️ CHANGE THIS TO YOUR EXACT FILENAME SITTING IN THE ROOT
+      # 🛠️ 1. REPLACE WITH YOUR EXACT ROOT CSPROJ FILENAME
       Dll_Project_Path: USMHandler.csproj 
+      
+      # 🛠️ 2. REPLACE WITH YOUR EXACT DLL FILENAME OUTPUT TARGET
+      Dll_Output_Path: bin/Release/net8.0/PSO2USMHandler.dll 
 
     steps:
     - name: Checkout Code
@@ -21,10 +24,17 @@ jobs:
     - name: Install .NET SDK
       uses: actions/setup-dotnet@v4
       with:
-        dotnet-version: '8.0.x'
+        dotnet-version: '8.0.x' # ◄ Match your project version (e.g., 6.0.x, 8.0.x)
 
     - name: Restore DLL Dependencies
       run: dotnet restore ${{ env.Dll_Project_Path }}
 
     - name: Build DLL Project Only
       run: dotnet build ${{ env.Dll_Project_Path }} --configuration Release --no-restore
+
+    - name: Save Compiled DLL Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Compiled-Core-DLL # ◄ The name of the zip link on your web dashboard
+        path: ${{ env.Dll_Output_Path }} # ◄ Grabs the exact compiled library file
+        if-no-files-found: error # ◄ Forces the build to fail if paths are typoed
