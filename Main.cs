@@ -1,10 +1,9 @@
-﻿using FFmpeg;
-using FFmpeg.AutoGen;
-using Microsoft.VisualBasic;
+﻿using Microsoft.VisualBasic;
 using System.Numerics;
 using System.Text;
 using System.Runtime.InteropServices;
 using System.IO.Pipelines;
+using USMHandler.Codecs;
 
 namespace USMHandler
 {
@@ -22,15 +21,11 @@ namespace USMHandler
 
         //audio param
         private const int AUDIO_FRAME_SIZE = 4096;
-        private unsafe AVCodecParserContext* _audioParser = null;
 
 
         // ADX Audio Decompressor State Keepers
         private static int _adxPrevSampleL = 0;
         private static int _adxPrevSampleR = 0;
-        private unsafe AVCodecContext* _audioCodecContext = null;
-        private unsafe AVFrame* _audioFrame = null;
-        private static unsafe SwrContext* _audioSwrContext = null;
 
 
 
@@ -39,29 +34,9 @@ namespace USMHandler
 
 
 
-        private static unsafe SwsContext* _swsContext = null;
-        private static unsafe AVFrame* _rgbFrame = null;
         private static byte[] _rgbBuffer;
-        // Low-level configuration variables required by FFmpeg.AutoGen
+        // Size of the chunks fed to the video decoder
         private const int INBUF_SIZE = 4096;
-
-        private unsafe AVCodecParserContext* _parser = null;
-        private unsafe AVCodecContext* _pCodecContext = null;
-        private unsafe AVFrame* _decodedFrame = null;
-
-
-        private unsafe bool CheckMpeg2Decoder()
-        {
-            AVCodec* codec = FFmpeg.AutoGen.ffmpeg.avcodec_find_decoder(AVCodecID.AV_CODEC_ID_MPEG2VIDEO);
-
-            if (codec == null)
-            {
-                return false;
-            }
-
-            Console.WriteLine("MPEG-2 decoder found.");
-            return true;
-        }
 
 
         public async Task<Stream> LoadDirectUSM(string filepath, byte[] key1, byte[] key2)
@@ -69,10 +44,6 @@ namespace USMHandler
             _playbackCts?.Cancel();
             _playbackCts?.Dispose();
             _playbackCts = new CancellationTokenSource();
-
-            FFmpeg.AutoGen.ffmpeg.RootPath = AppDomain.CurrentDomain.BaseDirectory + "FFMPEG";
-
-            Console.WriteLine(ffmpeg.av_version_info());
 
             smallerthanmb = false;
             hasAudio = false;
@@ -117,17 +88,6 @@ namespace USMHandler
             _playbackCts = new CancellationTokenSource();
 
             CancellationToken token = _playbackCts.Token;
-
-
-            FFmpeg.AutoGen.ffmpeg.RootPath = AppDomain.CurrentDomain.BaseDirectory + "FFMPEG";
-
-            if (!CheckMpeg2Decoder())
-            {
-                Console.WriteLine("MPEG-2 decoder was not found.");
-                return;
-            }
-
-
 
             var vms = new MemoryStream();
             var ams = new MemoryStream();
@@ -200,41 +160,26 @@ namespace USMHandler
         }
 
         // --- Brand New Method 1: Isolated Video Frame Decoder ---
-        private unsafe void StreamVideoOnlyWorker(DynamicMemoryStream videoData, CancellationToken token)
+        private void StreamVideoOnlyWorker(DynamicMemoryStream videoData, CancellationToken token)
         {
-            AVCodec* codec = ffmpeg.avcodec_find_decoder(AVCodecID.AV_CODEC_ID_MPEG2VIDEO);
-            if (codec == null)
-            {
-                return;
-            }
+            var decoder = new Mpeg2VideoDecoder();
+            decoder.FrameReady = OnVideoFrameDecoded;
 
-            AVCodecContext* videoCtx = ffmpeg.avcodec_alloc_context3(codec);
-            AVCodecParserContext* videoParser = ffmpeg.av_parser_init(AVCodecID.AV_CODEC_ID_MPEG2VIDEO);
-            AVFrame* videoFrame = ffmpeg.av_frame_alloc();
-
-            if (ffmpeg.avcodec_open2(videoCtx, codec, null) < 0)
-            {
-                return;
-            }
-
-            AVPacket* pkt = ffmpeg.av_packet_alloc();
-            byte[] inbuf = new byte[INBUF_SIZE + ffmpeg.AV_INPUT_BUFFER_PADDING_SIZE];
+            byte[] inbuf = new byte[INBUF_SIZE];
 
             double frameDurationMs = 0;
             System.Diagnostics.Stopwatch videoClock = new System.Diagnostics.Stopwatch();
             long processedVideoFrames = 0;
-            bool parse_succeed = true;
 
-            while (parse_succeed)
+            while (true)
             {
                 if (token.IsCancellationRequested)
                     return;
                 if (!videoClock.IsRunning)
                 {
-                    if (videoCtx->framerate.den > 0 && videoCtx->framerate.num > 0)
-                        frameDurationMs = (1000.0 * videoCtx->framerate.den) / videoCtx->framerate.num;
-                    else
-                        frameDurationMs = 1000.0 / 29.97;
+                    // Playback is paced at a fixed 29.97 fps; the USM sequence headers do not carry
+                    // the real frame rate reliably.
+                    frameDurationMs = 1000.0 / 29.97;
 
                     videoClock.Start();
                 }
@@ -242,32 +187,7 @@ namespace USMHandler
                 int data_size = videoData.Read(inbuf, 0, INBUF_SIZE);
                 if (data_size == 0) break;
 
-                fixed (byte* ptr = inbuf)
-                {
-                    byte* data = ptr;
-                    while (data_size > 0)
-                    {
-                        byte* outData = null;
-                        int outSize = 0;
-
-                        int ret = ffmpeg.av_parser_parse2(videoParser, videoCtx,
-                            &outData, &outSize, data, data_size, ffmpeg.AV_NOPTS_VALUE, ffmpeg.AV_NOPTS_VALUE, 0);
-
-                        if (ret < 0) break;
-
-                        pkt->data = outData;
-                        pkt->size = outSize;
-                        data += ret;
-                        data_size -= ret;
-
-                        if (pkt->size != 0)
-                        {
-                            parse_succeed = decode(videoCtx, videoFrame, pkt);
-                            if (!parse_succeed) break;
-                            processedVideoFrames++;
-                        }
-                    }
-                }
+                processedVideoFrames += decoder.Decode(inbuf, 0, data_size);
 
                 // Throttle the video loop to real-time target framerate
                 long expectedVideoTimeMs = (long)(processedVideoFrames * frameDurationMs);
@@ -280,78 +200,71 @@ namespace USMHandler
                 }
             }
 
-            // Cleanup video allocations
-            decode(videoCtx, videoFrame, null);
-            ffmpeg.av_packet_free(&pkt);
-            if (videoParser != null) ffmpeg.av_parser_close(videoParser);
-            if (videoCtx != null) ffmpeg.avcodec_free_context(&videoCtx);
-            if (videoFrame != null) ffmpeg.av_frame_free(&videoFrame);
+            // Output the frames the decoder is still holding back
+            decoder.Flush();
         }
 
         public delegate void AudioPcmDataHandler(    byte[] pcmData,    int sampleRate,    int channels,    int bitsPerSample);
 
         public event AudioPcmDataHandler? AudioPcmDataDecoded;
 
-        private unsafe void StreamAudioOnlyWorker(DynamicMemoryStream audioData, CancellationToken token)
+        private void StreamAudioOnlyWorker(DynamicMemoryStream audioData, CancellationToken token)
         {
-            AVCodec* audioCodec =
-                ffmpeg.avcodec_find_decoder(AVCodecID.AV_CODEC_ID_ADPCM_ADX);
-
-            if (audioCodec == null)
-                return;
-
-            AVCodecContext* audioCtx =
-                ffmpeg.avcodec_alloc_context3(audioCodec);
-
-            AVCodecParserContext* audioParser =
-                ffmpeg.av_parser_init(AVCodecID.AV_CODEC_ID_ADPCM_ADX);
-
-            AVFrame* audioFrame =
-                ffmpeg.av_frame_alloc();
-
-            if (audioCtx == null || audioParser == null || audioFrame == null)
-            {
-                if (audioParser != null)
-                    ffmpeg.av_parser_close(audioParser);
-
-                if (audioCtx != null)
-                    ffmpeg.avcodec_free_context(&audioCtx);
-
-                if (audioFrame != null)
-                    ffmpeg.av_frame_free(&audioFrame);
-
-                return;
-            }
-
-            if (ffmpeg.avcodec_open2(audioCtx, audioCodec, null) < 0)
-            {
-                ffmpeg.av_parser_close(audioParser);
-                ffmpeg.avcodec_free_context(&audioCtx);
-                ffmpeg.av_frame_free(&audioFrame);
-                return;
-            }
-
             const int targetSampleRate = 48000;
             const int targetChannels = 2;
             const int targetBitsPerSample = 16;
-            const int bytesPerStereoFrame = targetChannels * sizeof(short); // 4 bytes
 
-            AVPacket* audioPkt = ffmpeg.av_packet_alloc();
+            var adx = new AdxDecoder();
+            StereoResampler? resampler = null;
             byte[] audioBuffer = new byte[65536];
-            bool parseSucceed = true;
-            SwrContext* audioSwrContext = null;
 
             // ⏱️ HIGH-PRECISION FLOW THROTTLE
             System.Diagnostics.Stopwatch playbackClock = new System.Diagnostics.Stopwatch();
             double totalDecodedAudioMs = 0;
             bool clockStarted = false;
 
+            void OnAdxFrame(short[] samples, int sampleFrames)
+            {
+                if (token.IsCancellationRequested)
+                    return;
+
+                resampler ??= new StereoResampler(adx.SampleRate, adx.Channels, targetSampleRate);
+
+                int convertedSamples = resampler.Process(samples, sampleFrames, out short[] stereo);
+                if (convertedSamples <= 0)
+                    return;
+
+                byte[] pcmData = new byte[convertedSamples * targetChannels * sizeof(short)];
+                Buffer.BlockCopy(stereo, 0, pcmData, 0, pcmData.Length);
+
+                // ⏱️ TIMELINE MATH:
+                // Convert the number of processed samples into exact audio timeline milliseconds.
+                double sampleDurationMs = ((double)convertedSamples / targetSampleRate) * 1000.0;
+                totalDecodedAudioMs += sampleDurationMs;
+
+                // Start tracking real-world time the moment the first sample block completes
+                if (!clockStarted)
+                {
+                    playbackClock.Start();
+                    clockStarted = true;
+                }
+
+                /*
+                 * OUTPUT DRIVEN BY SELF-PACED REAL-TIME CLOCK
+                 */
+                AudioPcmDataDecoded?.Invoke(
+                    pcmData,
+                    targetSampleRate,
+                    targetChannels,
+                    targetBitsPerSample);
+            }
+
             try
             {
-                while (parseSucceed && !token.IsCancellationRequested)
+                while (!adx.Finished && !token.IsCancellationRequested)
                 {
                     // ⏳ BACKPRESSURE THROTTLE:
-                    // If the loop has decoded more than 300ms ahead of real-world time, 
+                    // If the loop has decoded more than 300ms ahead of real-world time,
                     // force the thread to sleep until the real-world timeline catches up.
                     if (clockStarted && totalDecodedAudioMs > (playbackClock.Elapsed.TotalMilliseconds + 300))
                     {
@@ -368,178 +281,12 @@ namespace USMHandler
                     if (audioRead <= 0)
                         break;
 
-                    fixed (byte* audioPtr = audioBuffer)
-                    {
-                        byte* data = audioPtr;
-                        int remainingAudioSize = audioRead;
-
-                        while (
-                            remainingAudioSize > 0 &&
-                            !token.IsCancellationRequested)
-                        {
-                            byte* outAudioData = null;
-                            int outAudioSize = 0;
-
-                            int ret = ffmpeg.av_parser_parse2(
-                                audioParser,
-                                audioCtx,
-                                &outAudioData,
-                                &outAudioSize,
-                                data,
-                                remainingAudioSize,
-                                ffmpeg.AV_NOPTS_VALUE,
-                                ffmpeg.AV_NOPTS_VALUE,
-                                0);
-
-                            if (ret < 0)
-                            {
-                                parseSucceed = false;
-                                break;
-                            }
-
-                            data += ret;
-                            remainingAudioSize -= ret;
-
-                            audioPkt->data = outAudioData;
-                            audioPkt->size = outAudioSize;
-
-                            if (audioPkt->size == 0)
-                                continue;
-
-                            if (ffmpeg.avcodec_send_packet(
-                                audioCtx,
-                                audioPkt) < 0)
-                            {
-                                continue;
-                            }
-
-                            while (
-                                !token.IsCancellationRequested &&
-                                ffmpeg.avcodec_receive_frame(
-                                    audioCtx,
-                                    audioFrame) == 0)
-                            {
-                                int samples = audioFrame->nb_samples;
-
-                                if (samples <= 0)
-                                    continue;
-
-                                if (audioSwrContext == null)
-                                {
-                                    SwrContext* localSwr =
-                                        ffmpeg.swr_alloc();
-
-                                    AVChannelLayout targetLayout;
-
-                                    ffmpeg.av_channel_layout_default(
-                                        &targetLayout,
-                                        targetChannels);
-
-                                    AVChannelLayout srcLayout =
-                                        audioFrame->ch_layout;
-
-                                    int swrResult =
-                                        ffmpeg.swr_alloc_set_opts2(&localSwr, &targetLayout, AVSampleFormat.AV_SAMPLE_FMT_S16, targetSampleRate, &srcLayout, (AVSampleFormat)audioFrame->format, audioFrame->sample_rate, 0, null);
-
-                                    if (swrResult < 0 ||
-                                        localSwr == null)
-                                    {
-                                        if (localSwr != null)
-                                            ffmpeg.swr_free(&localSwr);
-
-                                        parseSucceed = false;
-                                        break;
-                                    }
-
-                                    if (ffmpeg.swr_init(localSwr) < 0)
-                                    {
-                                        ffmpeg.swr_free(&localSwr);
-                                        parseSucceed = false;
-                                        break;
-                                    }
-
-                                    audioSwrContext = localSwr;
-                                }
-
-                                int outSamples =
-                                    (int)ffmpeg.av_rescale_rnd(
-                                        samples,
-                                        targetSampleRate,
-                                        audioFrame->sample_rate,
-                                        AVRounding.AV_ROUND_UP);
-
-                                if (outSamples <= 0)
-                                    continue;
-
-                                byte[] pcmData =
-                                    new byte[
-                                        outSamples *
-                                        targetChannels *
-                                        sizeof(short)
-                                    ];
-
-                                int convertedSamples;
-
-                                fixed (byte* pcmPtr = pcmData)
-                                {
-                                    byte*[] outPlanes = { pcmPtr, null, null, null };
-
-                                    fixed (byte** outPlanesPtr = outPlanes)
-                                    {
-                                        convertedSamples =
-                                            ffmpeg.swr_convert(audioSwrContext, outPlanesPtr, outSamples, (byte**)audioFrame->extended_data, samples);
-                                    }
-                                }
-
-                                if (convertedSamples <= 0)
-                                    continue;
-
-                                int pcmByteCount =
-                                    convertedSamples *
-                                    targetChannels *
-                                    sizeof(short);
-
-                                if (pcmByteCount != pcmData.Length)
-                                {
-                                    Array.Resize(
-                                        ref pcmData,
-                                        pcmByteCount);
-                                }
-
-                                // ⏱️ TIMELINE MATH:
-                                // Convert the number of processed samples into exact audio timeline milliseconds.
-                                double sampleDurationMs = ((double)convertedSamples / targetSampleRate) * 1000.0;
-                                totalDecodedAudioMs += sampleDurationMs;
-
-                                // Start tracking real-world time the moment the first sample block completes
-                                if (!clockStarted)
-                                {
-                                    playbackClock.Start();
-                                    clockStarted = true;
-                                }
-
-                                /*
-                                 * OUTPUT DRIVEN BY SELF-PACED REAL-TIME CLOCK
-                                 */
-                                AudioPcmDataDecoded?.Invoke(
-                                    pcmData,
-                                    targetSampleRate,
-                                    targetChannels,
-                                    targetBitsPerSample);
-                            }
-                        }
-                    }
+                    adx.Decode(audioBuffer, 0, audioRead, OnAdxFrame);
                 }
             }
             finally
             {
                 playbackClock.Stop();
-
-                ffmpeg.av_packet_free(&audioPkt);
-                if (audioParser != null) ffmpeg.av_parser_close(audioParser);
-                if (audioCtx != null) ffmpeg.avcodec_free_context(&audioCtx);
-                if (audioFrame != null) ffmpeg.av_frame_free(&audioFrame);
-                if (audioSwrContext != null) ffmpeg.swr_free(&audioSwrContext);
             }
         }
 
@@ -611,46 +358,17 @@ namespace USMHandler
 
         public event VideoFrameDecodedHandler? VideoFrameDecoded;
 
-        // 3. This is your completely universal, Godot-free decode method layout:
-        private unsafe bool decode(AVCodecContext* pCodecContext, AVFrame* frame, AVPacket* pkt)
+        // 3. Converts each decoded YUV frame to raw RGB24 bytes and hands it to the host
+        private void OnVideoFrameDecoded(Mpeg2Frame frame, int width, int height)
         {
-            int ret = ffmpeg.avcodec_send_packet(pCodecContext, pkt);
-            if (ret < 0) return false;
+            int numBytes = width * height * 3;
+            if (_rgbBuffer == null || _rgbBuffer.Length != numBytes)
+                _rgbBuffer = new byte[numBytes];
 
-            while (ret >= 0)
-            {
-                ret = ffmpeg.avcodec_receive_frame(pCodecContext, frame);
-                if (ret == ffmpeg.AVERROR(ffmpeg.EAGAIN) || ret == ffmpeg.AVERROR_EOF) return true;
-                else if (ret < 0) return false;
+            YuvToRgb.Convert(frame, width, height, _rgbBuffer);
 
-                int w = frame->width;
-                int h = frame->height;
-
-                // Initialize unmanaged scaling on the very first frame
-                if (_swsContext == null)
-                {
-                    _rgbFrame = ffmpeg.av_frame_alloc();
-                    int numBytes = ffmpeg.av_image_get_buffer_size(AVPixelFormat.AV_PIX_FMT_RGB24, w, h, 1);
-                    _rgbBuffer = new byte[numBytes];
-                    _swsContext = ffmpeg.sws_getContext(w, h, (AVPixelFormat)frame->format, w, h, AVPixelFormat.AV_PIX_FMT_RGB24, (int)SwsFlags.SWS_BILINEAR, null, null, null);
-                }
-
-                // Convert unmanaged YUV frames to raw RGB24 bytes natively
-                var dstData = new byte_ptrArray4();
-                var dstLinesize = new int_array4();
-
-                fixed (byte* rgbBufferPtr = _rgbBuffer)
-                {
-                    ffmpeg.av_image_fill_arrays(ref dstData, ref dstLinesize, rgbBufferPtr, AVPixelFormat.AV_PIX_FMT_RGB24, w, h, 1);
-                    ffmpeg.sws_scale(_swsContext, frame->data, frame->linesize, 0, h, dstData, dstLinesize);
-
-                    // BARE MINIMUM DELIVERABLE: Fire the raw pointer address directly out of the DLL!
-                    // No threading delays, no memory copying, and no game engine frameworks required.
-                    VideoFrameDecoded?.Invoke(_rgbBuffer, w, h);
-                }
-            }
-
-            return true;
+            // No threading delays, no memory copying, and no game engine frameworks required.
+            VideoFrameDecoded?.Invoke(_rgbBuffer, width, height);
         }
 
 

@@ -1,14 +1,13 @@
 <h1>PSO2 USM Library</h1>
 
 A c# dll library to handle PSO2 and NGS USM video files.
-Uses FFMPEG.Autogen to handle decoding and GI-Cutscenes(https://github.com/ToaHartor/GI-cutscenes) for USM demuxing.
+Decodes MPEG-1/MPEG-2 video and ADX audio with built-in managed decoders (no native libraries needed) and uses GI-Cutscenes(https://github.com/ToaHartor/GI-cutscenes) for USM demuxing.
 Thanks as well to the pso2 modding community for information regarding usm files
 
 
 <h2>Setup</h2>
 
-Download the source and place the ffmpeg libraries in a folder called "FFMPEG".
-Make sure they match the architecture of your target platform.
+No native libraries or extra files are required; just reference the library.
 
 <h2>Usage</h2>
 
